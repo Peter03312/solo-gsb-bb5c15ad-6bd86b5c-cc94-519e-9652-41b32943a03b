@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
-from .models import HallIn, as_utc
+from .models import BatchPublishIn, HallIn, as_utc
 from .simulator import simulate
 from .store import StoredHall, store
 
@@ -57,6 +57,25 @@ def _reject_invalid(plan: dict, hall_id: str) -> JSONResponse:
     )
 
 
+def _batch_failure_reason(reason: str, message: str, **extra: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"code": reason, "message": message, **extra}
+    return out
+
+
+def _batch_rejected(failures: list[dict[str, Any]]) -> JSONResponse:
+    # Any optimistic-lock conflict is a 409; pure content errors are 422.
+    # Nothing in the batch was written and every stored version is unchanged.
+    status_code = 409 if any(f["reason"]["code"] == "version_mismatch" for f in failures) else 422
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ok": False,
+            "message": "Batch publish rejected; no hall was written and all versions are unchanged.",
+            "failures": failures,
+        },
+    )
+
+
 @app.get("/health", tags=["system"])
 def health() -> dict:
     return {"status": "ok", "halls": len(store.list())}
@@ -81,6 +100,127 @@ def put_hall(hall_id: str, hall: HallIn) -> Any:
     if stored is None:
         return _reject_invalid(plan, hall_id)
     return _plan_response(stored)
+
+
+@app.post(
+    "/halls/batch-publish",
+    status_code=status.HTTP_200_OK,
+    tags=["halls"],
+    summary="Atomically validate and publish multiple full hall orchestrations",
+)
+def batch_publish(batch: BatchPublishIn) -> Any:
+    """Publish a whole batch of halls or nothing.
+
+    Each item carries the target ``hall_id``, the ``expected_version`` it is
+    replacing (``null`` for a hall that has never been saved) and the full
+    ``orchestration``. Items reuse the exact single-hall validation and
+    timeline synthesis. Duplicate ids inside one request, an id/orchestration
+    mismatch, an invalid orchestration, or an expected-version mismatch causes
+    the whole batch to be rejected with per-hall reasons; no version changes.
+    On success every hall is atomically replaced and its version increments by 1.
+    """
+    items = batch.halls
+
+    # Phase 1 (no lock, pure functions): content checks that never depend on
+    # current store state — duplicate ids, id/orchestration mismatch, compile.
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for item in items:
+        (duplicates if item.hall_id in seen else seen).add(item.hall_id)
+
+    failures: list[dict[str, Any]] = []
+    content_failed: set[int] = set()
+    # Every non-duplicate item still goes through the read-only version check,
+    # so a batch where hall A is invalid and hall B is stale reports both at
+    # once. Each item contributes at most one reason (a content error takes
+    # precedence); only items that compiled successfully are ever committed.
+    version_checks: list[tuple[str, int | None]] = []
+    committable: list[tuple[str, int | None, HallIn, dict]] = []
+    for index, item in enumerate(items):
+        entry_base = {"index": index, "hall_id": item.hall_id}
+        if item.hall_id in duplicates:
+            failures.append(
+                {
+                    **entry_base,
+                    "reason": _batch_failure_reason(
+                        "duplicate_in_batch",
+                        f"Hall id '{item.hall_id}' appears more than once in the same batch.",
+                    ),
+                }
+            )
+            content_failed.add(index)
+            continue
+        version_checks.append((item.hall_id, item.expected_version))
+        if item.orchestration.id != item.hall_id:
+            failures.append(
+                {
+                    **entry_base,
+                    "reason": _batch_failure_reason(
+                        "id_mismatch",
+                        f"Item hall id '{item.hall_id}' does not match orchestration id "
+                        f"'{item.orchestration.id}'.",
+                    ),
+                }
+            )
+            content_failed.add(index)
+            continue
+        plan = store.compile(item.orchestration)
+        if not plan["ok"]:
+            failures.append(
+                {
+                    **entry_base,
+                    "reason": _batch_failure_reason(
+                        "orchestration_invalid",
+                        "Orchestration rejected; no timeline was saved.",
+                        errors=plan["errors"],
+                        warnings=plan["warnings"],
+                    ),
+                }
+            )
+            content_failed.add(index)
+            continue
+        committable.append((item.hall_id, item.expected_version, item.orchestration, plan))
+
+    # Read-only optimistic-lock snapshot for every addressable item. A version
+    # conflict is reported only when the item has no content failure already.
+    conflicts = store.batch_check_versions(version_checks)
+    for c in conflicts:
+        hall_id = c["hall_id"]
+        index = next(i for i, it in enumerate(items) if it.hall_id == hall_id)
+        if index in content_failed:
+            continue
+        failures.append({"index": index, "hall_id": hall_id, "reason": c})
+
+    if failures:
+        failures.sort(key=lambda f: f["index"])
+        return _batch_rejected(failures)
+
+    # All content checks and versions match — replace the whole batch atomically.
+    # batch_commit re-checks versions under the write lock, closing the race with
+    # a concurrent publish between the pre-check above and this commit.
+    stored_list, commit_conflicts = store.batch_commit(committable)
+    if commit_conflicts:
+        # Lost an optimistic-lock race (same expected version) to another writer.
+        for c in commit_conflicts:
+            hall_id = c["hall_id"]
+            failures.append(
+                {
+                    "index": next(i for i, it in enumerate(items) if it.hall_id == hall_id),
+                    "hall_id": hall_id,
+                    "reason": c,
+                }
+            )
+        failures.sort(key=lambda f: f["index"])
+        return _batch_rejected(failures)
+
+    # Preserve the order the caller submitted; each hall bumped its version once.
+    assert stored_list is not None
+    by_id = {s.spec.id: s for s in stored_list}
+    return {
+        "ok": True,
+        "count": len(stored_list),
+        "published": [_plan_response(by_id[it.hall_id]) for it in items],
+    }
 
 
 @app.post(

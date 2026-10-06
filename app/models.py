@@ -65,3 +65,28 @@ class HallIn(BaseModel):
 
     def normalized(self) -> "HallIn":
         return self.model_validate(self.model_dump(mode="json"))
+
+
+class BatchHallItem(BaseModel):
+    """One hall in a batch publish: target id, optimistic-lock version, full spec.
+
+    ``expected_version`` is the version the caller believes it is replacing;
+    ``None`` (null) means the hall does not exist yet and this call creates it.
+    """
+
+    hall_id: Annotated[str, Field(min_length=1, max_length=64, examples=["bronze-gallery"])]
+    expected_version: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            default=None,
+            description="Current version being replaced; null for a not-yet-saved hall.",
+        ),
+    ] = None
+    orchestration: HallIn
+
+
+class BatchPublishIn(BaseModel):
+    # A batch must contain at least one hall; duplicate hall ids are rejected
+    # by the endpoint (both occurrences are reported back).
+    halls: Annotated[list[BatchHallItem], Field(min_length=1)]

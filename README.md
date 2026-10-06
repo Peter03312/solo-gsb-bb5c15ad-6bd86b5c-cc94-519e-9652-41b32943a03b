@@ -47,6 +47,7 @@ pytest -q
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `PUT` | `/halls/{hall_id}` | 校验并全量保存一个展厅编排（成功 200，冲突 422 且不写入） |
+| `POST` | `/halls/batch-publish` | **一次原子发布多个展厅编排**（全成功或全不写入，乐观版本控制） |
 | `POST` | `/validate` | 只校验/试编译（dry run），不落库 |
 | `GET` | `/halls` | 列出已保存展厅 |
 | `GET` | `/halls/{hall_id}` | 获取编译后的完整计划 |
@@ -175,19 +176,126 @@ curl -sS -X PUT http://localhost:8080/halls/bad2 -H 'Content-Type: application/j
 
 ---
 
+## 批量发布多个展厅（原子提交）
+
+运营一次发布**多个展厅的完整灯光编排**，用 `POST /halls/batch-publish`。请求体是一个**非空**列表 `halls[]`，每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `hall_id` | 目标展厅 ID（同一批内不得重复） |
+| `expected_version` | 乐观锁：你认为当前正在替换的版本；**尚未保存的新展厅传 `null`** |
+| `orchestration` | 该展厅的完整编排，结构与 `PUT /halls/{hall_id}` 的请求体完全一致 |
+
+语义保证：
+
+- **逐项沿用**单展厅的校验与时间线合成规则（灯具引用、亮度范围、渐变区间不重叠、紧急抢占等）。
+- 任一项出现下列问题时，**整批拒绝、不写入任何展厅，所有版本保持不变**，响应里给出每个问题展厅的 `index`、`hall_id` 与 `reason`：
+  - `duplicate_in_batch`（同批 ID 重复，422）；
+  - `id_mismatch`（`hall_id` 与 `orchestration.id` 不符，422）；
+  - `orchestration_invalid`（编排未通过校验，422，`reason.errors` 为单展厅同款结构化冲突明细）；
+  - `version_mismatch`（`expected_version` 与当前版本不符，**409**，返回 `expected_version` 与 `current_version`）。一批中既有内容错误又有版本冲突时，状态码取 **409** 且所有问题一次返回。
+- 全部通过时**原子替换整批展厅**，每个展厅版本恰好 **+1**（新建为 `1`），按提交顺序返回各自的新版本、完整计划与时间线。
+- **并发**发布涉及同一展厅且使用**相同 `expected_version`** 时，至多一方成功（另一方得到 409，需重新 `GET` 最新版本后再发布）。版本比对与整批写入在同一临界区完成。
+- 原有单展厅 HTTP API（`PUT`/`GET`/`DELETE` 等）与响应结构保持不变、继续可用。
+
+示例文件：[`examples/batch-publish.json`](examples/batch-publish.json)（第 1 项更新已存在的 `bronze-gallery`（期望版本 1），第 2 项以 `null` 创建新展厅 `porcelain-hall`）。
+
+### 6. 批量发布：成功（各自版本 +1，返回新版本与时间线）
+
+```bash
+# 先放入 bronze-gallery，使其处于版本 1
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery.json >/dev/null
+
+# 一次发布一批：更新 bronze-gallery（expected_version=1）+ 新建 porcelain-hall（null）
+curl -sS -X POST http://localhost:8080/halls/batch-publish \
+  -H 'Content-Type: application/json' \
+  --data @examples/batch-publish.json | jq '{ok, count, versions: [.published[] | {hall_id, version, lamps: .summary.lamps, commands: .summary.commands}]}'
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "versions": [
+    {"hall_id": "bronze-gallery", "version": 2, "lamps": 3, "commands": 13},
+    {"hall_id": "porcelain-hall",  "version": 1, "lamps": 2, "commands": 4}
+  ]
+}
+```
+
+`published[]` 每一项就是单展厅 `GET /halls/{hall_id}` 的完整响应（含 `timeline`、`preemptions`、`skipped_activations`、`warnings` 等）。
+
+### 7. 批量发布：版本冲突 → 409，整批不写入
+
+```bash
+# bronze-gallery 已被别人更新到版本 2，本批仍按版本 1 提交
+curl -sS -X POST http://localhost:8080/halls/batch-publish \
+  -H 'Content-Type: application/json' --data @examples/batch-publish.json
+```
+
+```json
+{
+  "ok": false,
+  "message": "Batch publish rejected; no hall was written and all versions are unchanged.",
+  "failures": [
+    {
+      "index": 0,
+      "hall_id": "bronze-gallery",
+      "reason": {
+        "code": "version_mismatch",
+        "hall_id": "bronze-gallery",
+        "message": "Expected hall 'bronze-gallery' at version 1, but current version is 2.",
+        "expected_version": 1,
+        "current_version": 2
+      }
+    }
+  ]
+}
+```
+
+此时同批的 `porcelain-hall` **也不会被创建**（整批原子）；`GET /halls/porcelain-hall` 返回 404，`bronze-gallery` 仍是版本 2。调用方应先 `GET` 取到最新版本、按最新编排重新校验后再发布。
+
+> 新建展厅请传 `expected_version: null`；若该 ID 已存在，会得到 `expected_version=null / current_version=<n>` 的 409。对不存在的展厅传非 `null` 版本，同样得到 409（`current_version: null`）。
+
+### 8. 批量发布：内容错误（ID 不符 / 编排无效 / 同批重复）→ 422
+
+整批中不同展厅可以同时出错，响应一次性列出，各自带 `index` 便于定位：
+
+```json
+{
+  "ok": false,
+  "message": "Batch publish rejected; no hall was written and all versions are unchanged.",
+  "failures": [
+    {"index": 0, "hall_id": "hall-x", "reason": {"code": "id_mismatch", "message": "Item hall id 'hall-x' does not match orchestration id 'different-id'."}},
+    {"index": 1, "hall_id": "hall-y", "reason": {"code": "orchestration_invalid", "message": "Orchestration rejected; no timeline was saved.",
+        "errors": [{"code": "fade_interval_overlap", "channel": "L1", "between_scenes": ["a", "b"], "...": "..."}], "warnings": []}}
+  ]
+}
+```
+
+空列表 `{"halls": []}`、缺字段、亮度越界等请求体形状错误由 Pydantic 直接返回 422（与单展厅一致），同样不写入。
+
+### 9. 并发发布相同预期版本：至多一方成功
+
+版本比较与整批写入在**同一个锁临界区**内完成。两个运营人员同时对版本 1 的同一展厅发起批量发布（都带 `expected_version: 1`）时：一方 `200`（版本变为 2），另一方 `409`（`current_version: 2`、其整批不写入）。失败方重新拉取版本 2 的当前编排、合并自己的修改后再提交即可。
+
+---
+
 ## 目录结构
 
 ```
 app/
-  models.py     # Pydantic 输入模型与时间归一化
+  models.py     # Pydantic 输入模型（含批量发布 BatchPublishIn）与时间归一化
   engine.py     # 纯函数：校验 + 时间线合成（抢占/恢复/跳过）
   simulator.py  # 任意时刻的通道状态模拟
-  store.py      # 线程安全内存存储
-  main.py       # FastAPI 路由
+  store.py      # 线程安全内存存储：单展厅 put 与批量原子 batch_commit（乐观版本检查）
+  main.py       # FastAPI 路由（单展厅 + POST /halls/batch-publish）
 tests/
-  test_api.py   # 16 个端到端用例
+  test_api.py   # 33 个端到端用例（单展厅 16 + 批量发布 17，含并发）
 examples/
   bronze-gallery.json
+  batch-publish.json   # 批量发布请求示例（更新 + 新建）
 Dockerfile
 docker-compose.yml
 requirements.txt
