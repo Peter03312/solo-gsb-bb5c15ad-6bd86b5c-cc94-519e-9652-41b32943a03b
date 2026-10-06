@@ -7,17 +7,19 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
-from .models import HallIn, as_utc
+from .models import BatchPublishIn, HallIn, as_utc
 from .simulator import simulate
 from .store import StoredHall, store
 
 app = FastAPI(
     title="Museum Lighting Orchestration API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compile scheduled light scenes into an executable per-channel timeline. "
         "Validates lamp references, brightness ranges and non-overlapping fade intervals; "
-        "emergency scenes preempt normal scenes and release only to scenes still in window."
+        "emergency scenes preempt normal scenes and release only to scenes still in window. "
+        "Single halls are replaced unconditionally; batches are published atomically "
+        "with optimistic per-hall version checks."
     ),
 )
 
@@ -81,6 +83,46 @@ def put_hall(hall_id: str, hall: HallIn) -> Any:
     if stored is None:
         return _reject_invalid(plan, hall_id)
     return _plan_response(stored)
+
+
+@app.post(
+    "/halls/batch",
+    status_code=status.HTTP_200_OK,
+    tags=["halls"],
+    summary="Atomically publish a batch of hall orchestrations (all-or-nothing)",
+)
+def publish_batch(batch: BatchPublishIn) -> Any:
+    ids = [it.hall_id for it in batch.items]
+    duplicated = sorted({i for i in ids if ids.count(i) > 1})
+    if duplicated:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "duplicate_hall_id",
+                "message": "Hall ids must be unique within a batch; "
+                f"duplicated: {', '.join(duplicated)}.",
+                "duplicated_hall_ids": duplicated,
+            },
+        )
+    stored, failures = store.publish_batch(
+        [(it.hall_id, it.expected_version, it.hall) for it in batch.items]
+    )
+    if stored is None:
+        # 409 with one entry per rejected hall; nothing was written and every
+        # version is unchanged, so the caller can fix and retry the same batch.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "message": "Batch publish rejected; no hall was written and all versions remain unchanged.",
+                "failures": failures,
+            },
+        )
+    return {
+        "ok": True,
+        "count": len(stored),
+        "published": [_plan_response(s) for s in stored],
+    }
 
 
 @app.post(

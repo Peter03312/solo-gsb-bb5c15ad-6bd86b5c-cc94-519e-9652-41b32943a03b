@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models import HallIn
 from app.store import store
 
 
@@ -290,3 +291,177 @@ def test_delete_and_404():
 def test_id_mismatch_is_400():
     r = client.put("/halls/other", json=VALID_HALL)
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Batch publish (POST /halls/batch)
+# --------------------------------------------------------------------------- #
+def hall_spec(hid, lamp_id="L1", level=50):
+    """A minimal valid orchestration body for hall ``hid``."""
+    return {
+        "id": hid,
+        "lamps": [lamp(lamp_id)],
+        "scenes": [scene("s1", iso(2026, 10, 5, 8), iso(2026, 10, 5, 20), [item(lamp_id, level)])],
+    }
+
+
+def bitem(hid, expected, hall):
+    return {"hall_id": hid, "expected_version": expected, "hall": hall}
+
+
+def test_batch_publish_new_halls():
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", None, hall_spec("h1")),
+        bitem("h2", None, hall_spec("h2")),
+    ]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["count"] == 2
+    versions = {p["hall_id"]: p["version"] for p in body["published"]}
+    assert versions == {"h1": 1, "h2": 1}
+    # each entry carries the freshly compiled timeline, like the single-hall PUT
+    assert all(p["timeline"]["L1"] for p in body["published"])
+    assert client.get("/halls").json()["count"] == 2
+
+
+def test_batch_publish_increments_existing_versions():
+    client.put("/halls/h1", json=hall_spec("h1"))
+    client.put("/halls/h2", json=hall_spec("h2"))
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", 1, hall_spec("h1", level=60)),
+        bitem("h2", 1, hall_spec("h2", level=70)),
+    ]})
+    assert r.status_code == 200, r.text
+    versions = {p["hall_id"]: p["version"] for p in r.json()["published"]}
+    assert versions == {"h1": 2, "h2": 2}
+    assert client.get("/halls/h1").json()["timeline"]["L1"][0]["to_level"] == 60
+
+    # mixed batch: update an existing hall and create a new one atomically
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", 2, hall_spec("h1", level=55)),
+        bitem("h3", None, hall_spec("h3")),
+    ]})
+    assert r.status_code == 200, r.text
+    versions = {p["hall_id"]: p["version"] for p in r.json()["published"]}
+    assert versions == {"h1": 3, "h3": 1}
+
+
+def test_batch_version_conflict_rejects_whole_batch():
+    client.put("/halls/h1", json=hall_spec("h1"))
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", 5, hall_spec("h1")),       # stale expected version
+        bitem("h2", None, hall_spec("h2")),    # would be valid on its own
+    ]})
+    assert r.status_code == 409
+    body = r.json()
+    assert body["ok"] is False
+    (f,) = body["failures"]
+    assert f["hall_id"] == "h1" and f["code"] == "version_conflict"
+    assert f["expected_version"] == 5 and f["current_version"] == 1
+    # nothing written: h1 keeps version 1, h2 was never created
+    assert client.get("/halls/h1").json()["version"] == 1
+    assert client.get("/halls/h2").status_code == 404
+
+
+def test_batch_expected_null_but_hall_exists():
+    client.put("/halls/h1", json=hall_spec("h1"))
+    r = client.post("/halls/batch", json={"items": [bitem("h1", None, hall_spec("h1"))]})
+    assert r.status_code == 409
+    (f,) = r.json()["failures"]
+    assert f["code"] == "version_conflict"
+    assert f["expected_version"] is None and f["current_version"] == 1
+    assert client.get("/halls/h1").json()["version"] == 1
+
+
+def test_batch_expected_version_but_hall_missing():
+    r = client.post("/halls/batch", json={"items": [bitem("ghost", 1, hall_spec("ghost"))]})
+    assert r.status_code == 409
+    (f,) = r.json()["failures"]
+    assert f["code"] == "version_conflict" and f["current_version"] is None
+    assert client.get("/halls/ghost").status_code == 404
+
+
+def test_batch_invalid_orchestration_rejects_all():
+    client.put("/halls/h1", json=hall_spec("h1"))
+    bad = hall_spec("h2")
+    bad["scenes"][0]["items"] = [{"lamp_id": "GHOST", "level": 50}]
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", 1, hall_spec("h1", level=66)),
+        bitem("h2", None, bad),
+    ]})
+    assert r.status_code == 409
+    (f,) = r.json()["failures"]
+    assert f["hall_id"] == "h2" and f["code"] == "invalid_orchestration"
+    assert any(e["code"] == "unknown_lamp" for e in f["errors"])
+    # the valid sibling item was not persisted either
+    assert client.get("/halls/h1").json()["version"] == 1
+    assert client.get("/halls/h2").status_code == 404
+
+
+def test_batch_id_mismatch_rejects_batch():
+    r = client.post("/halls/batch", json={"items": [bitem("h1", None, hall_spec("other"))]})
+    assert r.status_code == 409
+    (f,) = r.json()["failures"]
+    assert f["code"] == "id_mismatch" and f["hall_id"] == "h1"
+    assert client.get("/halls/h1").status_code == 404
+    assert client.get("/halls/other").status_code == 404
+
+
+def test_batch_collects_multiple_failures():
+    client.put("/halls/h1", json=hall_spec("h1"))
+    bad = hall_spec("h2")
+    bad["scenes"][0]["items"] = [{"lamp_id": "GHOST", "level": 50}]
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", 9, hall_spec("h1")),        # version conflict
+        bitem("h2", None, bad),                 # invalid orchestration
+        bitem("h3", None, hall_spec("h3")),     # fine on its own
+    ]})
+    assert r.status_code == 409
+    by_hall = {f["hall_id"]: f for f in r.json()["failures"]}
+    assert by_hall["h1"]["code"] == "version_conflict"
+    assert by_hall["h2"]["code"] == "invalid_orchestration"
+    assert "h3" not in by_hall
+    assert client.get("/halls/h1").json()["version"] == 1
+    assert client.get("/halls/h3").status_code == 404
+
+
+def test_batch_duplicate_ids_rejected():
+    r = client.post("/halls/batch", json={"items": [
+        bitem("h1", None, hall_spec("h1")),
+        bitem("h1", None, hall_spec("h1")),
+    ]})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "duplicate_hall_id"
+    assert client.get("/halls/h1").status_code == 404
+
+
+def test_batch_empty_items_rejected():
+    r = client.post("/halls/batch", json={"items": []})
+    assert r.status_code == 422
+
+
+def test_batch_concurrent_publish_same_expected_version_only_one_wins():
+    import threading
+
+    spec = HallIn.model_validate(hall_spec("h"))
+    stored, _ = store.put(spec)
+    assert stored.version == 1
+
+    results = []
+
+    def worker():
+        results.append(store.publish_batch([("h", 1, spec)]))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if r[0] is not None]
+    conflicts = [r for r in results if r[0] is None]
+    assert len(successes) == 1
+    assert len(conflicts) == 7
+    assert all(f[1][0]["code"] == "version_conflict" for f in conflicts)
+    # exactly one increment happened
+    assert store.get("h").version == 2

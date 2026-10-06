@@ -11,6 +11,7 @@
 2. **合成可执行时间线**：按通道输出排序后的指令序列（`fade` / `emergency_enter` / `emergency_exit`），每条指令带 `at`、`from_level`、`to_level`、`fade_end_at`，可直接下发 DMX/调光网关。
 3. **紧急抢占**：紧急场景（`priority: "emergency"`）在 `start_at` 立即抢占普通场景；在 `end_at` 释放通道时，**只恢复到"抢占前已经开始、且释放时仍在生效时间窗内"的那个普通场景**；在紧急期间才到点的普通场景标记为 `skipped`，不会被恢复执行。
 4. 校验失败返回 **HTTP 422** 和结构化冲突明细（通道/区间/原因），**不保存无效编排**。
+5. **批量原子发布**：`POST /halls/batch` 一次发布多个展厅的完整编排，每项携带 `expected_version` 做乐观并发校验（尚未保存的展厅传 `null`）。任一展厅 ID 不符、编排无效或版本冲突时，**整批不写入、所有版本保持不变**（409 + 逐项原因）；全部通过才原子替换整批，各展厅版本各自 +1。并发发布涉及同一展厅且预期版本相同时，**至多一方成功**。
 
 ---
 
@@ -47,6 +48,7 @@ pytest -q
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `PUT` | `/halls/{hall_id}` | 校验并全量保存一个展厅编排（成功 200，冲突 422 且不写入） |
+| `POST` | `/halls/batch` | 批量原子发布多个展厅编排（全部通过才写入；失败 409 且整批不写入） |
 | `POST` | `/validate` | 只校验/试编译（dry run），不落库 |
 | `GET` | `/halls` | 列出已保存展厅 |
 | `GET` | `/halls/{hall_id}` | 获取编译后的完整计划 |
@@ -173,21 +175,82 @@ curl -sS -X PUT http://localhost:8080/halls/bad2 -H 'Content-Type: application/j
 - 新普通场景恰好在释放的同一时刻开始：它直接接管通道，`emergency_exit` 带 `taken_over_by`，不产生可见的亮度跳变。
 - 紧急场景只影响自己 `items` 中列出的通道，其他通道时间线完全不变。
 
+### 6. 批量发布（原子 + 乐观并发）
+
+`POST /halls/batch` 一次发布多个展厅的完整编排。请求体：
+
+```json
+{
+  "items": [
+    {"hall_id": "bronze-gallery", "expected_version": 1,    "hall": { "...完整编排..." }},
+    {"hall_id": "jade-gallery",   "expected_version": null, "hall": { "...完整编排..." }}
+  ]
+}
+```
+
+- `items` 至少 1 项，且同批 `hall_id` 不得重复（否则 400 `duplicate_hall_id`）；
+- 每项的 `hall_id` 必须与 `hall.id` 一致；`expected_version` 是该展厅当前已保存的版本，**尚未保存的展厅传 `null`**；
+- 逐项沿用与单展厅相同的校验与时间线合成规则；
+- **任一**项 ID 不符（`id_mismatch`）、编排无效（`invalid_orchestration`）或版本与当前状态不符（`version_conflict`）时，返回 **409** 与逐项原因，**整批不写入、所有版本保持不变**；
+- 全部通过时原子替换整批，各展厅版本各自 +1，响应逐项返回新版本与完整时间线；
+- 并发发布涉及同一展厅且使用相同 `expected_version` 时，至多一方成功（版本检查与写入在同一临界区完成）。
+
+示例文件：[`examples/batch-publish.json`](examples/batch-publish.json)（更新 `bronze-gallery` 并新建 `jade-gallery`）。
+
+```bash
+# 先发布初版（版本变为 1）
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery.json
+
+# 批量发布：更新 bronze-gallery（预期版本 1）+ 新建 jade-gallery（预期版本 null）
+curl -sS -X POST http://localhost:8080/halls/batch \
+  -H 'Content-Type: application/json' --data @examples/batch-publish.json | jq
+```
+
+成功响应（200）节选：
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "published": [
+    {"hall_id": "bronze-gallery", "version": 2, "summary": {"lamps": 3, "scenes": 4, "commands": 13, "preemptions": 2, "...": "..."}, "timeline": {"lamp-case-1": ["..."]}},
+    {"hall_id": "jade-gallery",   "version": 1, "summary": {"lamps": 2, "scenes": 2, "commands": 4,  "preemptions": 0, "...": "..."}, "timeline": {"lamp-jade-1": ["..."]}}
+  ]
+}
+```
+
+**重复执行同一批次**（`expected_version` 已过期）→ 409，且两个展厅都保持原版本：
+
+```json
+{
+  "ok": false,
+  "message": "Batch publish rejected; no hall was written and all versions remain unchanged.",
+  "failures": [
+    {"hall_id": "bronze-gallery", "code": "version_conflict", "message": "Expected version 1 but current version is 2.", "expected_version": 1, "current_version": 2},
+    {"hall_id": "jade-gallery", "code": "version_conflict", "message": "Hall already exists at version 1; expected_version was null (reserved for halls not yet saved).", "expected_version": null, "current_version": 1}
+  ]
+}
+```
+
+状态码约定：`200` 整批发布成功；`400` 批内展厅 ID 重复；`409` 逐项失败（`failures[]` 给出展厅与原因，整批未写入）；`422` 请求体形状不合法（如 `items` 为空、亮度越界等字段级错误）。
+
 ---
 
 ## 目录结构
 
 ```
 app/
-  models.py     # Pydantic 输入模型与时间归一化
+  models.py     # Pydantic 输入模型（含批量发布请求）与时间归一化
   engine.py     # 纯函数：校验 + 时间线合成（抢占/恢复/跳过）
   simulator.py  # 任意时刻的通道状态模拟
-  store.py      # 线程安全内存存储
+  store.py      # 线程安全内存存储（单展厅写入 + 批量原子 compare-and-set）
   main.py       # FastAPI 路由
 tests/
-  test_api.py   # 16 个端到端用例
+  test_api.py   # 27 个端到端用例（含批量发布与并发）
 examples/
   bronze-gallery.json
+  batch-publish.json
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -65,3 +65,19 @@ class HallIn(BaseModel):
 
     def normalized(self) -> "HallIn":
         return self.model_validate(self.model_dump(mode="json"))
+
+
+class BatchHallItemIn(BaseModel):
+    """One hall inside a batch publish: identity, optimistic-concurrency token
+    and the full orchestration that replaces the stored one."""
+
+    hall_id: Annotated[str, Field(min_length=1, max_length=64)]
+    # null means "this hall is expected to not exist yet" (first publish).
+    expected_version: Annotated[int, Field(ge=1)] | None = Field(default=None)
+    hall: HallIn
+
+
+class BatchPublishIn(BaseModel):
+    """Atomic all-or-nothing batch publish request (at least one hall)."""
+
+    items: Annotated[list[BatchHallItemIn], Field(min_length=1)]
